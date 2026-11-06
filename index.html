@@ -867,7 +867,6 @@ function onModel(gltf) {
   proxy('Hips', [0, 1.2, -0.03], 0.32, 'belly');
   proxy('LeftFoot', [0.18, 0.1, 0.02], 0.2, 'footL');
   proxy('RightFoot', [-0.18, 0.1, 0.02], 0.2, 'footR');
-
   // Aus der T-Pose in eine entspannte Pose: Arme nach unten (rein per Code, Achsen-unabhängig)
   const aim = (bone, child, dir) => {
     const b = Bn[bone], c = Bn[child]; if (!b || !c) return;
@@ -883,6 +882,12 @@ function onModel(gltf) {
   aim('LeftForeArm', 'LeftHand', new THREE.Vector3(0.12, -1, 0.25));
   aim('RightForeArm', 'RightHand', new THREE.Vector3(-0.12, -1, 0.25));
   model.updateMatrixWorld(true);
+  ['Left', 'Right'].forEach(sd => {                    // Hände (zum Hochheben); Position aus dem Knochen
+    const hb = Bn[sd + 'Hand']; if (!hb) return;
+    const hp = hb.getWorldPosition(new THREE.Vector3());
+    proxy(sd + 'Hand', [hp.x, hp.y, hp.z + 0.04], 0.21, sd === 'Left' ? 'handL' : 'handR');
+  });
+
 
   // Grundpose merken: lokale Drehung + Welt-Drehung des Elternknochens
   for (const n of BONES) {
@@ -1088,7 +1093,7 @@ const Lis = { on: false, w: 0 };                       // HUHU hört zu
 const Talk = { on: false, w: 0, m: 0 };                // HUHU spricht (Stimme wird abgespielt)
 const Pet = { target: 0, w: 0, lastGiggle: 0, lastHeart: 0 };
 const Hit = { n: 0, t: 0 };
-const locked = () => L.fall || L.mic || Talk.on || Game.active || Sleep.on || Brush.on || (Clip.on && Clip.hit);
+const locked = () => L.fall || L.mic || Talk.on || Game.active || Sleep.on || Brush.on || Lift.on || (Clip.on && Clip.hit);
 
 /* ---------- kleine Effekt-Helfer (DOM-Overlays) ---------- */
 function fxEl(html, cls, x, y, life) {
@@ -1770,6 +1775,170 @@ function careUpdate(dt, clk) {
   }
 }
 /* =====================================================================
+   HOCHHEBEN: Kopf, Hände oder Füße gedrückt halten und über den Bildschirm ziehen.
+   Der Körper hängt wie ein Pendel am Griffpunkt, Arme und Beine zappeln,
+   beim Loslassen fällt HUHU zurück auf den Boden (mit Hüpfer).
+   ===================================================================== */
+const Lift = {
+  on: false, phase: '', part: null, side: '', p0: [0, 0], p1: [0, 0], a0: 0, L: 1,
+  x: 0, y: 0, vx: 0, vy: 0, tx: 0, ty: 0, ox: 0, oy: 0, psi: 0, psiv: 0, th: 0, h: 0, armW: 0, t: 0,
+  Rx: 0, Ry: 0, vth: 0, landed: 0, hit: false, giggleT: 0, heard: false
+};
+const LIFT_P = { head: [0, 2.04], handL: [0.4, 2.0], handR: [-0.4, 2.0], footL: [0.18, 0.12], footR: [-0.18, 0.12] };   // Griffpunkt (Körperraum)
+const LIFT_PTS = [[0, 0], [0.22, 0], [-0.22, 0], [0, 2.5], [0.55, 1.4], [-0.55, 1.4], [0.3, 0.9], [-0.3, 0.9]];      // für die Boden-Kollision
+const LIFT_COM = [0, 1.2];
+const LIFT_TOP = 3.0;
+let _lpl = null;
+
+/* Finger-Position -> Welt-Koordinaten auf der Körper-Ebene (z = 0) */
+function ptrWorld(e) {
+  if (!M3) return null;
+  if (!_lpl) _lpl = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+  ndc.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const v = new THREE.Vector3();
+  return ray.ray.intersectPlane(_lpl, v) ? [v.x, v.y] : null;
+}
+const _sm = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+function liftStart(region) {
+  const w = ptrWorld({ clientX: drag.x, clientY: drag.y }); if (!w) return;
+  if (Anim.major) Anim.cancelMajor();
+  Pet.target = 0; Hit.n = 0;
+  const L0 = Lift, p1 = LIFT_P[region].slice();
+  L0.part = region; L0.side = region === 'handL' ? 'Left' : region === 'handR' ? 'Right' : '';
+  let p0 = p1.slice();
+  if (L0.side && Bn[L0.side + 'Hand']) {                      // Hand startet dort, wo sie gerade hängt, und streckt sich nach oben
+    const v = Bn[L0.side + 'Hand'].getWorldPosition(new THREE.Vector3()); p0 = [v.x, v.y];
+  }
+  L0.p0 = p0; L0.p1 = p1;
+  const dx = LIFT_COM[0] - p1[0], dy = LIFT_COM[1] - p1[1];
+  L0.a0 = Math.atan2(dy, dx); L0.L = Math.max(0.8, Math.hypot(dx, dy));
+  L0.x = p0[0]; L0.y = p0[1]; L0.vx = L0.vy = 0;
+  L0.ox = clamp(L0.x - w[0], -0.5, 0.5); L0.oy = clamp(L0.y - w[1], -0.5, 0.5);
+  L0.tx = L0.x; L0.ty = L0.y;
+  L0.psi = L0.a0 + PI / 2; L0.psiv = 0; L0.th = 0; L0.h = 0; L0.armW = 0; L0.t = 0;
+  L0.giggleT = 0; L0.heard = false; L0.landed = 0; L0.hit = false;
+  L0.phase = 'hold'; L0.on = true;
+  Snd.init(); Snd.boing(); burst('✨', headNow(), 1);
+}
+function liftMove(e) {
+  const w = ptrWorld(e); if (!w) return;
+  const lim = Math.max(0.6, worldHalfWidth() - 0.4);
+  Lift.tx = clamp(w[0] + Lift.ox, -lim, lim);
+  Lift.ty = clamp(w[1] + Lift.oy, Math.min(0.05, Lift.p0[1]), Lift.part[0] === 'f' ? LIFT_TOP : LIFT_TOP - 0.4);   // oben soll nichts abgeschnitten werden
+}
+function liftRelease() {
+  if (!Lift.on || Lift.phase !== 'hold') return;
+  Lift.phase = 'drop';
+  Lift.vx = clamp(Lift.vx * 0.5, -3, 3); Lift.vy = clamp(Lift.vy * 0.5, -2, 4);
+  Lift.th -= Math.round(Lift.th / (2 * PI)) * 2 * PI;          // Drehung auf (-π, π] bringen (optisch identisch)
+  Lift.vth = Lift.psiv * Lift.h * 0.5;
+  Lift.landed = 0; Lift.hit = false; Lift.t = 0;
+  Lift.fromH = Lift.Ry;
+}
+function liftEnd() {
+  Lift.on = false; Lift.phase = '';
+  ['Left', 'Right'].forEach(s => { IK[s].w = 0; IK[s].t = null; });
+}
+function liftFloor(th) {              // wie weit muss der Körper angehoben werden, damit nichts im Boden steckt
+  let mn = 0; const s = Math.sin(th), c = Math.cos(th);
+  for (const p of LIFT_PTS) mn = Math.min(mn, p[0] * s + p[1] * c);
+  return -mn;
+}
+/* Zappeln: Arme und Beine reagieren auf Schwung und Zeit */
+function liftLimbs(time, h, sw) {
+  const f = (k, ph) => Math.sin(time * k + ph);
+  const kick = (side, sg, ph) => {
+    const isGrab = Lift.part === 'foot' + side;
+    const k = isGrab ? 0.1 : 1;
+    o(side + 'UpLeg', (-0.25 - 0.3 * (0.5 + 0.5 * f(8, ph)) + 0.4 * sg * sw) * h * k, 0, 0.12 * sg * h * k * f(5, ph));
+    o(side + 'Leg', 0.5 * h * k * (0.5 + 0.5 * f(8, ph + 1)), 0, 0);
+  };
+  kick('Left', 1, 0); kick('Right', -1, 2.4);
+  const arm = (side, sg, ph) => {
+    if (Lift.part === 'hand' + (side === 'Left' ? 'L' : 'R')) return;        // diesen Arm hält IK
+    o(side + 'Arm', 0, 0, sg * (0.8 + 0.45 * f(9, ph) + 0.5 * sw) * h);
+    o(side + 'ForeArm', 0, 0, sg * 0.25 * h * f(11, ph));
+  };
+  arm('Left', 1, 0.5); arm('Right', -1, 2.9);
+  o('Head', 0.05 * h, 0, (0.14 * f(5.5, 0.3) + 0.25 * sw) * h);
+  mouth(h * (0.3 + 0.3 * Math.abs(f(6, 0))));
+}
+
+function liftUpdate(dt, time) {
+  const Lf = Lift;
+  if (!Lf.on) {                                                   // gedrückt halten erkennen
+    if (!drag || !M3 || !(drag.region in LIFT_P)) return;
+    if (locked() || Clip.on || L.fall) return;
+    const held = performance.now() - drag.t;
+    if ((held > 380 && drag.path < 45) || (drag.region !== 'head' && drag.path > 26)) liftStart(drag.region);
+    return;
+  }
+  const px = LIFT_P[Lf.part][0], py = LIFT_P[Lf.part][1];
+  Lf.t += dt;
+  const u = _sm(0, 0.4, Lf.t);
+  const gx = Lf.p0[0] + (Lf.p1[0] - Lf.p0[0]) * u, gy = Lf.p0[1] + (Lf.p1[1] - Lf.p0[1]) * u;      // aktueller Griffpunkt (Hand streckt sich)
+  let Rx, Ry, th;
+
+  if (Lf.phase === 'hold') {
+    // Griffpunkt folgt dem Finger (gedämpfte Feder) -> Schwung fürs Pendel
+    const k = 90, c = 17, ax = k * (Lf.tx - Lf.x) - c * Lf.vx, ay = k * (Lf.ty - Lf.y) - c * Lf.vy;
+    Lf.vx += ax * dt; Lf.vy += ay * dt; Lf.x += Lf.vx * dt; Lf.y += Lf.vy * dt;
+    const axe = clamp(ax * 0.22, -22, 22);
+    const n = 2, h2 = dt / n;
+    for (let i = 0; i < n; i++) {                                 // Pendel: psi = Abweichung von "senkrecht nach unten"
+      const acc = -(15 * Math.sin(Lf.psi) + axe * Math.cos(Lf.psi)) / Lf.L - 1.5 * Lf.psiv;
+      Lf.psiv += acc * h2; Lf.psi += Lf.psiv * h2;
+    }
+    Lf.h += (_sm(0, 0.35, Lf.y - Lf.p1[1]) - Lf.h) * (1 - Math.exp(-dt * 14));
+    th = (Lf.psi - PI / 2 - Lf.a0) * Lf.h; Lf.th = th;
+    Rx = Lf.x - (gx * Math.cos(th) - gy * Math.sin(th));
+    Ry = Lf.y - (gx * Math.sin(th) + gy * Math.cos(th));
+    const fl = liftFloor(th); if (Ry < fl) Ry = fl;               // nie in den Boden
+    Lf.Rx = Rx; Lf.Ry = Ry;
+    // Reaktionen
+    liftLimbs(time, Lf.h, clamp(Lf.psiv * 0.15, -0.6, 0.6));
+    if (Lf.side) {                                                // gehaltene Hand: Arm per IK zum Griffpunkt
+      Lf.armW += (1 - Lf.armW) * (1 - Math.exp(-dt * 12));
+      IK[Lf.side].w = Lf.armW; IK[Lf.side].t = new THREE.Vector3(Lf.x, Lf.y, 0.25);
+    }
+    Lf.giggleT -= dt;
+    if (Lf.h > 0.5 && Lf.giggleT <= 0) { Lf.giggleT = 2.6; Snd.giggle(Lf.heard ? 2 : 4); if (!Lf.heard) { Lf.heard = true; burst('💖', headNow(), 2); } }
+  } else {                                                        // Loslassen: fallen, aufkommen, aufrichten
+    th = Lf.th; Rx = Lf.Rx; Ry = Lf.Ry;
+    Lf.vy -= 22 * dt; Ry += Lf.vy * dt; Rx += Lf.vx * dt; Lf.vx *= Math.exp(-dt * 1.2);
+    const tgt = Math.round(th / (2 * PI)) * 2 * PI;
+    th += (tgt - th) * (1 - Math.exp(-dt * (Lf.landed ? 9 : 5)));
+    const fl = liftFloor(th);
+    if (Ry <= fl && Lf.vy < 0) {
+      Ry = fl;
+      if (Lf.vy < -2.2) Lf.vy = -Lf.vy * 0.33; else Lf.vy = 0;
+      if (!Lf.hit) {
+        Lf.hit = true; Lf.landed = 0.001;
+        const hd = Lf.fromH;
+        Snd.bonk(); if (hd > 0.5) { Snd.oops(); burst('💫', headNow(), 1); }
+        const big = clamp(hd / 1.5, 0.3, 1);
+        Anim.start('land', 0.9, (t) => {
+          const e = Math.exp(-5 * t), cs = Math.cos(t * 16);
+          squash(1.0 * big * e * Math.max(0, cs)); o('Spine', 0.28 * big * e * cs); o('Spine1', 0.15 * big * e * cs);
+          o('LeftArm', 0, 0, 0.5 * big * e * cs); o('RightArm', 0, 0, -0.5 * big * e * cs);
+          mouth(0.35 * big * e);
+        }, null, false);
+      }
+    }
+    if (Lf.landed) {
+      Lf.landed += dt; Rx *= Math.exp(-dt * 4.5);
+      if (Lf.landed > 1.0 && Math.abs(th) < 0.02 && Math.abs(Rx) < 0.02) { Lf.th = 0; liftEnd(); Snd.giggle(3); return; }
+    }
+    Lf.th = th; Lf.Rx = Rx; Lf.Ry = Ry;
+    Lf.h *= Math.exp(-dt * 4);
+    liftLimbs(time, Lf.h, 0);
+    if (Lf.side) { IK[Lf.side].w *= Math.exp(-dt * 9); }
+  }
+  R.x += Rx; R.y += Ry; R.rz += th;
+}
+/* =====================================================================
    6) EINGABE (Streicheln / Schlagen / Boxen / Treten)
    ===================================================================== */
 let started = false, drag = null;
@@ -1783,13 +1952,14 @@ stageEl.addEventListener('pointerdown', e => {
   if (Clip.on && Clip.hit) return;
   if (L.fall) return;
   const region = pick(e); if (!region) return;
-  drag = { region, x: e.clientX, y: e.clientY, t: performance.now(), path: 0 };
+  drag = { region, x: e.clientX, y: e.clientY, t: performance.now(), path: 0, ex: e.clientX, ey: e.clientY };
   try { stageEl.setPointerCapture(e.pointerId); } catch (_) {}
 });
 stageEl.addEventListener('pointermove', e => {
   if (Game.active) { if (Game.dragging) gameDrag(e); return; }
   if (Brush.on) { brushMove(e); return; }
   if (!drag) return;
+  if (Lift.on) { liftMove(e); return; }
   drag.path += Math.hypot(e.clientX - drag.x, e.clientY - drag.y); drag.x = e.clientX; drag.y = e.clientY;
   // Sanftes Bewegen über dem Kopf = Streicheln
   if (drag.region === 'head' && drag.path > 40 && !L.fall && !L.mic && !Talk.on) { Pet.target = 1; Pet.last = performance.now(); }
@@ -1797,6 +1967,7 @@ stageEl.addEventListener('pointermove', e => {
 function endPointer() {
   Game.dragging = false; Brush.down = false; Brush.last = null;
   if (!drag) return;
+  if (Lift.on) { drag = null; liftRelease(); return; }
   const d = drag; drag = null; Pet.target = 0;
   const quick = performance.now() - d.t < 450 && d.path < 24;
   if (!quick || locked()) return;
@@ -1992,6 +2163,7 @@ function frame(nowMs) {
   updateClip(dt);
   Anim.tick(dt);
   careUpdate(dt, clock);
+  liftUpdate(dt, clock);
   // Herzchen beim Streicheln + Kichern
   if (Pet.target && Pet.w > 0.5) {
     const t = performance.now();
